@@ -121,11 +121,11 @@ mod tests {
     // Restart policy is stored in SandboxSpec, and the count and well-known
     // timestamps are stored in SandboxStatus. Legacy payloads decode with
     // Unspecified (treated as Never), zero count, and absent timestamps.
-    // ProviderProfileFile is reachable from stored provider profiles. Its
-    // additive declaration changes the durable and public/durable overlap
-    // inventories; the provider-environment file map is public-only. The
-    // request has no provider-file capability field: older supervisors ignore
-    // the additive file map while retaining the rest of the response.
+    // ProviderProfileFile and ProviderProfileEnvironment are reachable from
+    // stored provider profiles. Their additive declarations change the public,
+    // durable, and overlap inventories while preserving existing field tags and
+    // legacy payload decoding. The provider-environment file map is public-only;
+    // older supervisors ignore it while retaining the rest of the response.
     // Preparation timing adds two optional timestamps to SandboxProvisioning.
     // Existing rows decode with both absent and retain their active deadline;
     // no stored attempt gains another phase or time budget on upgrade.
@@ -139,11 +139,11 @@ mod tests {
     // SessionRedirect and SupervisorHello.redirected are supervisor control
     // traffic and are never stored.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "65f095ab84e3fa37ff2a933bbd22bd1cd337e23faf2a517bc9b4e72ed325c28d";
+        "b16f8919434d03ad40e7a6336239f6fd66ecef9c9acfa0856e8f32933b5b8051";
     const DURABLE_SCHEMA_SHA256: &str =
-        "c2d62733c8c4a17d831729ea261373b42e979f00ef5b6f79761f3501f27e6fc5";
+        "0b36d08f1d1eea7f39723c935df83e9db50fd66475a1aa51033469471b24fd89";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "e6823be4512eb3731a1a04aa89215b6c2c2acaef1c99735c1a4c9e3b50ff8ee4";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -608,9 +608,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (307, 27),
-                (93, 21),
-                (81, 21),
+                (310, 27),
+                (96, 21),
+                (84, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -734,6 +734,8 @@ mod tests {
         let profile = profile.profile.expect("profile");
         assert_eq!(profile.id, "profile");
         assert_eq!(profile.display_name, "Legacy");
+        assert!(profile.environment.is_none());
+        assert!(profile.required_platform_adapter.is_empty());
 
         let policy_payload =
             PolicyRevisionPayload::decode(legacy_bytes(V0_0_116_POLICY_PAYLOAD).as_slice())
