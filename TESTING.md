@@ -50,8 +50,8 @@ Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:che
 
 ### PostgreSQL-backed tests
 
-Tests that need a real PostgreSQL server are `#[ignore]`d and named
-`postgres_*`. Run them with:
+Tests that need a real PostgreSQL server, such as advisory-lock concurrency
+across two stores, are `#[ignore]`d and named `postgres_*`. Run them with:
 
 ```shell
 mise run test:rust:postgres
