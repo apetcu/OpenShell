@@ -195,6 +195,7 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                         openshell_cli::oidc_auth::oidc_refresh_token(
                             &bundle,
                             meta.oidc_scopes.as_deref(),
+                            meta.oidc_audience.as_deref(),
                             insecure,
                         ),
                     )

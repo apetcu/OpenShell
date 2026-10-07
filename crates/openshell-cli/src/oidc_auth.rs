@@ -469,16 +469,33 @@ pub async fn oidc_device_code_flow(
 ///
 /// Preserves the existing refresh token if the server does not return a new
 /// one (per OAuth 2.0 spec, the refresh response may omit `refresh_token`).
+///
+/// Client credentials logins get no refresh token, so those bundles are
+/// renewed by repeating the client credentials grant with
+/// `OPENSHELL_OIDC_CLIENT_SECRET`.
 pub async fn oidc_refresh_token(
     bundle: &OidcTokenBundle,
     scopes: Option<&str>,
+    audience: Option<&str>,
     insecure: bool,
 ) -> Result<OidcTokenBundle> {
-    let refresh_token = bundle.refresh_token.as_deref().ok_or_else(|| {
-        miette::miette!(
-            "no refresh token available — re-authenticate with: openshell gateway login"
+    let Some(refresh_token) = bundle.refresh_token.as_deref() else {
+        if std::env::var_os("OPENSHELL_OIDC_CLIENT_SECRET").is_none() {
+            return Err(miette::miette!(
+                "no refresh token available; set OPENSHELL_OIDC_CLIENT_SECRET to renew a \
+                 client credentials token, or re-authenticate with: openshell gateway login"
+            ));
+        }
+        debug!("no refresh token stored, renewing with the client credentials grant");
+        return oidc_client_credentials_flow(
+            &bundle.issuer,
+            &bundle.client_id,
+            audience,
+            scopes,
+            insecure,
         )
-    })?;
+        .await;
+    };
 
     let scopes = scopes.map_or_else(Vec::new, |scopes| {
         scopes.split_whitespace().map(str::to_owned).collect()
@@ -534,10 +551,10 @@ pub async fn ensure_valid_oidc_token_bundle(
         gateway = gateway_name,
         "OIDC token expired, attempting refresh"
     );
-    let scopes = openshell_bootstrap::load_gateway_metadata(gateway_name)
-        .ok()
-        .and_then(|metadata| metadata.oidc_scopes);
-    let refreshed = oidc_refresh_token(&bundle, scopes.as_deref(), insecure).await?;
+    let metadata = openshell_bootstrap::load_gateway_metadata(gateway_name).ok();
+    let scopes = metadata.as_ref().and_then(|m| m.oidc_scopes.as_deref());
+    let audience = metadata.as_ref().and_then(|m| m.oidc_audience.as_deref());
+    let refreshed = oidc_refresh_token(&bundle, scopes, audience, insecure).await?;
     openshell_bootstrap::oidc_token::store_oidc_token(gateway_name, &refreshed)?;
     Ok(refreshed)
 }
@@ -1033,5 +1050,121 @@ mod tests {
         let result =
             bundle_from_device_token_response(&response, "https://issuer.example", "test-client");
         assert!(result.is_err());
+    }
+
+    /// Serve OIDC discovery and a token endpoint on localhost, recording each
+    /// token request body. Returns the issuer URL.
+    async fn spawn_token_server(token_bodies: Arc<Mutex<Vec<String>>>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let server_issuer = issuer.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                // Read headers, then as much body as Content-Length announces.
+                let (head, body) = loop {
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let len = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= len || n == 0 {
+                            break (head.to_string(), body.to_string());
+                        }
+                    }
+                };
+                let response_body = if head.starts_with("GET /.well-known/openid-configuration") {
+                    serde_json::json!({
+                        "issuer": server_issuer,
+                        "authorization_endpoint": format!("{server_issuer}/auth"),
+                        "token_endpoint": format!("{server_issuer}/token"),
+                    })
+                } else {
+                    token_bodies.lock().unwrap().push(body);
+                    serde_json::json!({
+                        "access_token": "renewed-access",
+                        "token_type": "Bearer",
+                        "expires_in": 300,
+                    })
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        issuer
+    }
+
+    fn expired_client_credentials_bundle(issuer: &str) -> OidcTokenBundle {
+        OidcTokenBundle {
+            access_token: "expired-access".to_string(),
+            refresh_token: None,
+            expires_at: Some(0),
+            issuer: issuer.to_string(),
+            client_id: "ci-client".to_string(),
+        }
+    }
+
+    #[test]
+    fn refresh_renews_client_credentials_bundle_with_secret() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let token_bodies = Arc::new(Mutex::new(Vec::new()));
+        let issuer = rt.block_on(spawn_token_server(token_bodies.clone()));
+        let bundle = expired_client_credentials_bundle(&issuer);
+
+        let refreshed = temp_env::with_var("OPENSHELL_OIDC_CLIENT_SECRET", Some("s3cret"), || {
+            rt.block_on(oidc_refresh_token(
+                &bundle,
+                Some("openshell:api"),
+                Some("openshell-gateway"),
+                false,
+            ))
+        })
+        .expect("client credentials bundle should renew");
+
+        assert_eq!(refreshed.access_token, "renewed-access");
+        assert!(refreshed.refresh_token.is_none());
+        assert!(refreshed.expires_at.is_some_and(|t| t > 0));
+        assert_eq!(refreshed.issuer, issuer);
+        assert_eq!(refreshed.client_id, "ci-client");
+
+        let bodies = token_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("grant_type=client_credentials"));
+        assert!(bodies[0].contains("client_id=ci-client"));
+        assert!(bodies[0].contains("audience=openshell-gateway"));
+        assert!(bodies[0].contains("scope=openshell%3Aapi"));
+    }
+
+    #[test]
+    fn refresh_without_refresh_token_or_secret_names_the_secret() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bundle = expired_client_credentials_bundle("http://127.0.0.1:1");
+
+        let err = temp_env::with_var_unset("OPENSHELL_OIDC_CLIENT_SECRET", || {
+            rt.block_on(oidc_refresh_token(&bundle, None, None, false))
+        })
+        .expect_err("renewal without a refresh token or secret must fail");
+
+        assert!(
+            err.to_string().contains("OPENSHELL_OIDC_CLIENT_SECRET"),
+            "unexpected error: {err}"
+        );
     }
 }

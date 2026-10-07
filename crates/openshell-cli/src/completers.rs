@@ -145,6 +145,7 @@ async fn completion_grpc_client(
                         match oidc_refresh_token(
                             &bundle,
                             meta.oidc_scopes.as_deref(),
+                            meta.oidc_audience.as_deref(),
                             tls_opts.gateway_insecure,
                         )
                         .await
